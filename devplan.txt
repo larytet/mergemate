@@ -1,0 +1,337 @@
+1) Web server & core API
+
+Stack: Python FastAPI + Uvicorn, Postgres, Redis (queue + rate limiting), Celery/RQ (workers).
+
+Service boundaries
+
+mergemate-api: synchronous endpoints (Slack acks, webhooks, health).
+
+mergemate-worker: async review pipeline (diff retrieval → prompting → MR comments → Slack post).
+
+mergemate-cli (optional): helper in CI jobs to build payloads.
+
+Endpoints (v1)
+
+Health/ops
+
+GET /healthz, GET /readyz, GET /version
+
+Slack
+
+POST /slack/commands (slash: /submit-patch)
+
+POST /slack/events (app_mention, file_shared)
+
+POST /slack/interactions (modal/buttons)
+
+Git providers
+
+POST /gitlab/webhook (merge_request, push, notes)
+
+POST /github/webhook (optional parity)
+
+GET /gitlab/oauth/callback (installation)
+
+Reviews
+
+POST /review ← CI entry point (payload: repo, MR/commit range, diff, changed files, optional JIRA key, Slack channel/thread)
+
+GET /reviews/{id} (status/result)
+
+POST /reviews/{id}/approve (guarded)
+
+Patches
+
+POST /patch (Slack upload path; returns inferred repo, branch, draft MR URL)
+
+Admin/config (locked)
+
+GET/POST /config (policies, model choices, size limits, allowlist)
+
+Key request schemas (compact)
+
+POST /v1/review
+{
+  "provider": "gitlab",
+  "repo": "group/project",
+  "target": {"type":"mr", "id":12345},  // or {"type":"commit_range","from":"abc","to":"def"}
+  "diff": "<git-diff>",                  // optional if server can fetch
+  "files": [{"path":"a.py","content":"...","lang":"py"}], // optional excerpts
+  "jira": {"key":"ABC-123","title":"...", "description":"..."},
+  "slack": {"channel":"C123", "thread_ts":"171234.5678"},
+  "policies": {"scope":"syntax|showstoppers|typos", "auto_approve": false}
+}
+
+2) LLM integration (ChatGPT or similar)
+
+Abstraction
+Create a ModelProvider interface with adapters (OpenAI, Anthropic, local). Support:
+
+JSON-mode structured outputs for inline comments:
+[{path, line_range, severity, message, suggestion?}]
+
+Token budgeting & chunking: split diff by file/hunk; short context windows.
+
+Two prompt templates:
+
+Quick Gate: syntax/showstoppers only (fast, cheap).
+
+Deep Dive: adds small excerpts & JIRA description; still narrow by policy.
+
+Safety & focus
+
+System prompt enforces scope (syntax, showstoppers, typos); forbid speculative refactors.
+
+Refuse changes that alter behavior unless categorized as “showstopper”.
+
+LLM calls (pipeline)
+
+Summarize MR (optional): short title + key risks.
+
+Per-file scan: produce structured findings.
+
+Auto-approval assessor: gate by size, confidence, CI status, severity=none.
+
+3) GitLab (and GitHub) integration
+
+Auth & scopes
+
+Slack installation is separate. For GitLab, prefer OAuth app per workspace; scopes: api, read_repository, write_repository (only if pushing branches), read_user.
+
+Least privilege: if you don’t auto-create MRs/approve, drop write_repository.
+
+Core flows
+
+Link existing MR: given MR ID, GET diff & changed files via REST; post review comments via MR Notes / Discussions; optionally set “Approve MR.”
+
+Create MR from patch (optional MVP+1):
+
+Apply .patch to a scratch fork or staging branch in a service-owned repo.
+
+Create MR back to the upstream project; label created-by:mergemate.
+
+Idempotency: compute review_fingerprint = sha256(repo, target, diff-hash, policy); ignore duplicates.
+
+Limits: cap review to N files / M lines; skip binaries & vendored dirs.
+
+APIs used
+
+MR diffs: GET /projects/:id/merge_requests/:iid/changes
+
+Notes: POST /projects/:id/merge_requests/:iid/notes
+
+Approvals: POST /projects/:id/merge_requests/:iid/approve (if enabled)
+
+Pipelines (optional): check status before auto-approve.
+
+(Keep GitHub at parity via pulls, reviews, comments, check-runs if you need it later.)
+
+4) Slack integration
+
+App pieces
+
+Bot user + Slash command (/submit-patch)
+
+Event subs: app_mention, message.channels, file_shared
+
+Scopes: chat:write, commands, files:read, channels:history, groups:history (if private), links:write (for unfurls)
+
+Interactions: Modals for Select repo/MR, Policy toggle, Auto-approve (off by default)
+
+UX flow
+
+/submit-patch → immediate ephemeral ack (“Review queued…”) within 3s
+
+Background job posts:
+
+Summary block (title, risk bullets, size)
+
+Inline findings grouped by file (show line ranges & suggestions)
+
+Buttons: Re-run (Deep Dive), Approve MR (guarded), Open MR
+
+Thread-first: all follow-ups happen in the same Slack thread.
+
+5) Review pipeline (background worker)
+
+States: RECEIVED → VALIDATED → FETCHED → CHUNKED → LLM_REVIEWED → POSTED → DONE
+Steps
+
+Validate payload & policies; rate-limit per user/repo.
+
+Fetch diff/files (or trust provided).
+
+Heuristics to pick top-N hunks (size/time caps).
+
+Run Quick Gate prompts across chunks (parallel with backpressure).
+
+Combine → dedupe → severity rank; build suggestions.
+
+Post Slack + MR comments; record audit.
+
+If auto_approve and no findings and CI green and size ≤ threshold → call Approve.
+
+6) Data model (Postgres, simplified)
+
+installations(id, slack_team, gitlab_group, oauth_tokens_enc, created_at)
+
+users(id, slack_user, git_ident, roles)
+
+repos(id, provider, full_name, settings_json)
+
+reviews(id, repo_id, target_json, policy_json, status, metrics_json, created_by, created_at)
+
+findings(id, review_id, path, line_from, line_to, severity, message, suggestion_json)
+
+audit_logs(id, actor, action, target, meta_json, ts)
+
+TTL old LLM payloads (e.g., 30–90 days) to reduce data risk.
+
+7) Security, privacy, compliance
+
+Secrets: all tokens in a vault (KMS-encrypted); rotate regularly.
+
+Slack & webhook verification: check signatures (Slack signing secret, GitLab X-Gitlab-Token).
+
+Row-level access: per installation/team.
+
+Data minimization: store only diffs and minimal excerpts; redact secrets; strip large binaries.
+
+PII: avoid collecting; if needed, tag & purge.
+
+Model privacy: allow no-log LLM endpoints where available; let admins choose provider & region.
+
+Kill switch: feature flag to disable auto-approval instantly.
+
+8) CI/CD & environments
+
+Containers: api and worker images.
+
+Kubernetes: HPA on worker queue depth; liveness/readiness probes.
+
+Config: environment-based (dev/stage/prod), Helm or Terraform modules.
+
+Observability:
+
+Logs: structured JSON (review_id correlation).
+
+Metrics: reviews_total, latency_ms, findings_per_kloc, auto_approvals_total, llm_tokens{in,out}.
+
+Tracing: OpenTelemetry around LLM calls & provider APIs.
+
+SLOs: P50 review time ≤ 90s for small PRs; P99 ≤ 7m under load.
+
+9) Policies & guardrails (match your caution)
+
+Default scope: syntax, showstoppers, typos only.
+
+Hard limits:
+
+No behavior-changing suggestions unless tagged showstopper.
+
+No bulk refactors; cap suggestions/file.
+
+Diff size caps; require human approval above thresholds.
+
+Auto-approval gate (disabled by default):
+
+CI green + 0 critical findings + ≤ 200 LOC changed + repo allowlist + labels like trivial-docs/tests.
+
+Transparency: stamp all bot actions with via MergeMate and a link to the review.
+
+10) Slack-first entry point (patch handling)
+
+Happy path
+
+User runs /submit-patch and uploads .patch or snippets.
+
+Modal asks: repo, target branch, policy, create-MR?
+
+Server applies patch in scratch fork (or a service-owned “patches” repo), creates MR, and kicks review.
+
+Post summary & link; inline findings land as MR notes.
+
+Fallbacks
+
+If patch can’t apply cleanly, post Slack reply with conflict locations and offer a local git am command.
+
+11) GitLab CI entry point
+
+.gitlab-ci.yml (example job)
+
+review:
+  stage: test
+  rules:
+    - if: '$CI_PIPELINE_SOURCE == "push"'
+    - if: '$CI_MERGE_REQUEST_IID'
+  script:
+    - pipx run mergemate-cli collect --out payload.json \
+        --repo "$CI_PROJECT_PATH" \
+        --mr "$CI_MERGE_REQUEST_IID" \
+        --jira-from-branch \
+        --max-lines 1200
+    - curl -sS -X POST "$MERGEMATE_URL/v1/review" \
+        -H "Authorization: Bearer $MERGEMATE_TOKEN" \
+        -H "Content-Type: application/json" \
+        --data @payload.json
+
+
+The CLI does diffing, light filtering, and JIRA extraction (e.g., ABC-123).
+
+12) Testing strategy
+
+Unit: prompt builders, chunkers, parsers, policy evaluator.
+
+Integration: fake GitLab/Slack servers; golden diffs → expected findings.
+
+Scenario tests: small MR, large MR (truncated), failing CI, noisy file types.
+
+Load: N parallel small PRs; ensure P99 under SLO.
+
+Security: signature tampering, token scope misuse, replay attacks.
+
+13) Metrics & evaluation (tie to the research you cited)
+
+Track both quality and throughput to catch the “AI slows merges” risk:
+
+PR lead time, review cycles, reopen rate, post-merge defects, % auto-approved, developer satisfaction (pulse).
+
+Run a 2–4 week gated pilot (subset of repos; auto-approval off), then expand.
+
+Continuous prompt tuning: measure % actionable vs. noisy findings; aim for ≥70% acted-on comments, ≤10% “noise” reports.
+
+14) Milestones (sane defaults)
+
+M0 — Skeleton (2–3 days)
+FastAPI app, healthz, Slack command ack, Redis/worker scaffolding.
+
+M1 — Slack → Review → Slack (1–2 weeks)
+Patch intake, MR link, Quick Gate prompts, Slack summary, MR comments; GitLab OAuth.
+
+M2 — CI entry (3–5 days)
+POST /review from GitLab; CLI helper; JIRA enrichment.
+
+M3 — Policies & guardrails (3–5 days)
+Size caps, repo allowlists, admin config, structured outputs.
+
+M4 — Auto-approval (behind flag) (1 week)
+Gate logic + one-click Slack confirm; audit logs.
+
+M5 — Hardening & Observability (ongoing)
+Rate limits, retries, metrics, on-call runbook.
+
+15) Minimal backlog (MVP)
+
+ FastAPI project + /slack/commands, /review, /gitlab/webhook
+
+ Redis queue + worker with pipeline states
+
+ ModelProvider(OpenAI) with Quick Gate template
+
+ GitLab MR fetch + note post; Slack summary thread
+
+ Policy: syntax/showstoppers/typos only; size caps
+
+ Admin config (YAML/env) for repo allowlists and model settings
+
+ Basic metrics (reviews_total, latency_ms) and structured logs
