@@ -131,3 +131,5 @@ On a push tragged in a certain way, collect context (diff, final versions of rel
 * https://www.marscode.com/extension a bug fixing system that combines code knowledge graphs, software analysis techniques, and LLMs. 
 
 * https://gru.ai/  a workflow-based bug fixing system developed by Gru. It first uses an LLM to select files related to the issue, then the LLM makes decisions on which files to change and how to change them.
+
+* https://workweave.dev/blog/the-price-of-mandatory-code-reviews  more code reviews lead to fewer bugs. The biggest gains happen between 0 and 0.5 reviews per PR - after that, diminishing returns kick in.
